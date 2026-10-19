@@ -199,8 +199,8 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame]:
         d[sid] = level.reindex(days)
         logret[sid], miss, spans = _gap_return(level, days)
         if sid == "DEXJPUS":
-            d["fx_holiday"], d["fx_multi_day"] = miss, spans
-        elif not miss.equals(d["fx_holiday"]):
+            d["fx_missing"], d["fx_multi_day"] = miss, spans
+        elif not miss.equals(d["fx_missing"]):
             raise AlignmentError(f"{sid} is missing on different days from DEXJPUS")
     d["r_yen"] = -logret["DEXJPUS"]  # section 4: positive means the yen appreciated
     d["r_dxyx"] = DXYX_SCALE * sum(w * logret[s] for s, w in DXYX_WEIGHTS.items())  # blank if any input blank
