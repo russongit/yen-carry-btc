@@ -1,0 +1,16 @@
+{
+  "run_commit": "bd65bd173d7c33260fbfa03850889f7a95c56149",
+  "run_utc": "2026-10-19T13:37:05Z",
+  "numpy": "2.1.0",
+  "pandas": "2.2.2",
+  "bootstrap": {
+    "reps": 2000,
+    "mean_block": 20,
+    "seed": 42
+  },
+  "outputs": [
+    "tables/h2_metrics.csv",
+    "tables/h2_bootstrap.csv",
+    "tables/h2_verdict.csv"
+  ]
+}

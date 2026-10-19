@@ -1,0 +1,4 @@
+comparison,competitor,precision_yen,precision_competitor,difference,base_rate,yen_episodes,competitor_episodes,pass
+primary,S_vix,0.1,1.0,-0.9,0.18729817007534985,10.0,1.0,False
+secondary,S_vix2,0.1,0.3333333333333333,-0.2333333333333333,0.18729817007534985,10.0,3.0,False
+combined (both must pass),,,,,,,,False
