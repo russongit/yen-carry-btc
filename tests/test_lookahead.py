@@ -263,9 +263,10 @@ import signals as sg  # noqa: E402
 
 SIGNAL_CUTOFFS = ["2018-06-29", "2020-03-16", "2024-08-05"]
 SIGNAL_STATS = ["yen_move5", "yen_vol20", "yen_vol20_pct80", "yen_move5_pct90", "yen_move5_pct85",
-                "yen_move5_pct95", "spx_ret5", "vix_pct", "spx_ret5_pct"]
-SIGNAL_OUTPUTS = ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq", "signal_unavailable",
-                  "S_yen_episode", "S_vix_episode", "S_eq_episode"]
+                "yen_move5_pct95", "spx_ret5", "vix_pct", "spx_ret5_pct",
+                "vix_change5", "vix_change5_pct2", "spx_ret5_pct2"]
+SIGNAL_OUTPUTS = ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq", "S_vix2", "S_eq2", "signal_unavailable",
+                  "S_yen_episode", "S_vix_episode", "S_eq_episode", "S_vix2_episode", "S_eq2_episode"]
 
 
 @pytest.fixture(scope="module")
@@ -276,9 +277,10 @@ def signals_full(baseline):
 @pytest.fixture(scope="module")
 def signals_truncated(baseline, signals_full):
     """Signals rerun on aligned data cut off at each date, with the calibrated q held fixed."""
-    out, _ = signals_full
-    q_v, q_e = int(out["q_v"].iloc[0]), int(out["q_e"].iloc[0])
-    return {c: sg.compute(baseline.loc[:c], q_v=q_v, q_e=q_e)[0] for c in SIGNAL_CUTOFFS}
+    out = signals_full[0]
+    q = dict(q_v=int(out["q_v"].iloc[0]), q_e=int(out["q_e"].iloc[0]),
+             q_v2=float(out["q_v2"].iloc[0]), q_e2=float(out["q_e2"].iloc[0]))
+    return {c: sg.compute(baseline.loc[:c], **q)[0] for c in SIGNAL_CUTOFFS}
 
 
 @pytest.mark.parametrize("cutoff", SIGNAL_CUTOFFS)
@@ -301,7 +303,7 @@ def test_calibration_ignores_test_period(baseline, signals_full):
     d = baseline.copy()
     after = d.index > sg.TRAIN_END
     d.loc[after, ["VIX", "SPX"]] *= SCRAMBLE
-    _, grid = sg.compute(d)
+    _, grid, _ = sg.compute(d)
     pd.testing.assert_frame_equal(grid, signals_full[1])
 
 
@@ -313,6 +315,40 @@ def test_calibration_tie_break_prefers_fewer_firings(signals_full):
     vix = grid[grid["signal"] == "vix"]
     best = vix[np.isclose(vix["abs_diff"], vix["abs_diff"].min(), rtol=0, atol=1e-12)]
     assert int(vix.loc[vix["chosen"], "q"].iloc[0]) == int(best["q"].max())
+
+
+def test_secondary_calibration_ignores_test_period(baseline, signals_full):
+    """Scrambling VIX, S&P 500 and the yen inputs after the training period must not change the secondary grid."""
+    d = baseline.copy()
+    after = d.index > sg.TRAIN_END
+    d.loc[after, ["VIX", "SPX", "DEXJPUS", "r_yen"]] *= SCRAMBLE
+    _, _, grid2 = sg.compute(d)
+    pd.testing.assert_frame_equal(grid2, signals_full[2], check_exact=True)
+
+
+def test_secondary_choice_is_eligible_and_follows_logged_order(signals_full):
+    grid2 = signals_full[2]
+    chosen = grid2[grid2["chosen"]]
+    assert len(chosen) == 2 and chosen["eligible"].all()
+    assert (chosen["training_days"] <= 2 * chosen["yen_training_days"]).all()
+    for name, prefer_high in [("vix_change5", True), ("equity", False)]:
+        g = grid2[(grid2["signal"] == name) & grid2["eligible"]]
+        best = g[g["episode_diff"] == g["episode_diff"].min()]
+        best = best[best["day_diff"] == best["day_diff"].min()]
+        expected = best["q"].max() if prefer_high else best["q"].min()
+        assert float(chosen.loc[chosen["signal"] == name, "q"].iloc[0]) == expected
+
+
+def test_pick_secondary_on_synthetic_grid():
+    grid = pd.DataFrame({
+        "signal": ["equity"] * 4,
+        "q": [0.5, 0.6, 0.7, 70.0],
+        "episode_diff": [1, 1, 1, 0],
+        "day_diff": [5, 3, 3, 700],
+        "eligible": [True, True, True, False],  # the exact episode match fires too often: excluded
+    })
+    assert sg.pick_secondary(grid, "equity", prefer_high=False) == 0.6
+    assert sg.pick_secondary(grid.assign(signal="vix_change5"), "vix_change5", prefer_high=True) == 0.7
 
 
 def test_yen_vol_rules_on_synthetic_returns():

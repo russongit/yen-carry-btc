@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ALIGNED = ROOT / "data" / "processed" / "aligned_daily.csv"
 OUT = ROOT / "data" / "processed" / "signals.csv"
 CALIBRATION = ROOT / "outputs" / "tables" / "calibration.csv"
+CALIBRATION_SECONDARY = ROOT / "outputs" / "tables" / "calibration_secondary.csv"
 
 # Section 3: signals are reported from the analysis start; training period for calibration (D4).
 ANALYSIS_START = pd.Timestamp("2018-01-02")
@@ -36,6 +37,10 @@ SENSITIVITY_MOVE_PCTS = (85, 95)  # section 8.5 sensitivity grid
 EQ_DAYS = 5            # section 6: S&P 500 5-day log return
 Q_GRID = range(1, 100)  # section 6: grid of whole percentiles
 EPISODE_GAP = 10       # section 6: signal days within 10 trading days share an episode
+# DEVIATIONS.md, secondary H2/H3 comparison: 5-day VIX change in points, grid 0.1 to 99.9 in 0.1 steps.
+VIX_CHANGE_DAYS = 5
+Q_GRID_FINE = [round(i / 10, 1) for i in range(1, 1000)]
+DAY_CAP_MULT = 2  # DEVIATIONS.md, day cap: at most 2x S_yen's training-period days
 
 
 class SignalError(RuntimeError):
@@ -104,9 +109,23 @@ def episodes(signal: pd.Series) -> tuple[pd.Series, pd.Series]:
     return ep, start
 
 
+def spx_ret5(d: pd.DataFrame) -> pd.Series:
+    """Section 6: S&P 500 5-day log return on NYSE days."""
+    return np.log(d["SPX"] / d["SPX"].shift(EQ_DAYS))
+
+
+def vix_change5(d: pd.DataFrame) -> pd.Series:
+    """DEVIATIONS.md, secondary comparison: VIX_t - VIX_{t-5} in points, the unit of section 4 dVIX."""
+    return d["VIX"] - d["VIX"].shift(VIX_CHANGE_DAYS)
+
+
+def n_episodes(signal: pd.Series) -> int:
+    return int(episodes(signal)[1].sum())
+
+
 def competing(d: pd.DataFrame, q_v: int, q_e: int) -> pd.DataFrame:
     """Section 6 competing signals at percentiles q_v (VIX, above) and q_e (S&P 500 5-day return, below)."""
-    spx5 = np.log(d["SPX"] / d["SPX"].shift(EQ_DAYS))
+    spx5 = spx_ret5(d)
     out = pd.DataFrame(index=d.index)
     out["spx_ret5"] = spx5
     out["vix_pct"] = expanding_pct(d["VIX"], q_v)
@@ -126,7 +145,7 @@ def calibrate(d: pd.DataFrame, s_yen: pd.Series) -> tuple[int, int, pd.DataFrame
     """
     train = (d.index >= TRAIN_START) & (d.index <= TRAIN_END)
     target = float(s_yen[train].astype(float).mean())
-    spx5 = np.log(d["SPX"] / d["SPX"].shift(EQ_DAYS))
+    spx5 = spx_ret5(d)
     rows = []
     for q in Q_GRID:
         f_v = float((d["VIX"] > expanding_pct(d["VIX"], q))[train].mean())
@@ -135,19 +154,70 @@ def calibrate(d: pd.DataFrame, s_yen: pd.Series) -> tuple[int, int, pd.DataFrame
     grid = pd.DataFrame(rows, columns=["signal", "q", "training_freq"])
     grid["yen_training_freq"] = target
     grid["abs_diff"] = (grid["training_freq"] - target).abs()
-
-    def pick(name: str, prefer_high: bool) -> int:
-        g = grid[grid["signal"] == name]
-        best = g[np.isclose(g["abs_diff"], g["abs_diff"].min(), rtol=0, atol=1e-12)]
-        return int(best["q"].max() if prefer_high else best["q"].min())
-
-    q_v, q_e = pick("vix", True), pick("equity", False)
+    q_v, q_e = pick_primary(grid, "vix", True), pick_primary(grid, "equity", False)
     grid["chosen"] = ((grid["signal"] == "vix") & (grid["q"] == q_v)) | ((grid["signal"] == "equity") & (grid["q"] == q_e))
     return q_v, q_e, grid
 
 
-def compute(d: pd.DataFrame, q_v: int | None = None, q_e: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """All section 6 signals. If q_v and q_e are given, calibration is skipped (used by tests)."""
+def pick_primary(grid: pd.DataFrame, name: str, prefer_high: bool) -> int:
+    """Closest training frequency; ties to the higher q (VIX) or lower q (equity), decision D."""
+    g = grid[grid["signal"] == name]
+    best = g[np.isclose(g["abs_diff"], g["abs_diff"].min(), rtol=0, atol=1e-12)]
+    return int(best["q"].max() if prefer_high else best["q"].min())
+
+
+def pick_secondary(grid: pd.DataFrame, name: str, prefer_high: bool) -> float:
+    """DEVIATIONS.md, secondary comparison: closest training episode count, then closest training-day
+    count (the same as closest frequency, since the denominator is fixed), then the higher q (VIX) or
+    lower q (equity), decision D."""
+    g = grid[(grid["signal"] == name) & grid["eligible"]]
+    order = g.assign(qkey=-g["q"] if prefer_high else g["q"]).sort_values(["episode_diff", "day_diff", "qkey"])
+    return float(order["q"].iloc[0])
+
+
+def calibrate_secondary(d: pd.DataFrame, s_yen: pd.Series) -> tuple[float, float, pd.DataFrame]:
+    """DEVIATIONS.md, secondary H2/H3 comparison: match each competing signal to the number of S_yen
+    episodes in the training period, on a 0.1-step grid. Only training days are counted (episodes are
+    formed on training days only), and every expanding percentile uses data through that day only.
+    """
+    train = (d.index >= TRAIN_START) & (d.index <= TRAIN_END)
+    yen = s_yen[train].fillna(0).astype(int)
+    yen_eps, yen_days = n_episodes(yen), int(yen.sum())
+    vix5, spx5 = vix_change5(d), spx_ret5(d)
+    rows = []
+    for q in Q_GRID_FINE:
+        sv = (vix5 > expanding_pct(vix5, q))[train].astype(int)
+        se = (spx5 < expanding_pct(spx5, q))[train].astype(int)
+        rows += [("vix_change5", q, n_episodes(sv), int(sv.sum())), ("equity", q, n_episodes(se), int(se.sum()))]
+    grid = pd.DataFrame(rows, columns=["signal", "q", "training_episodes", "training_days"])
+    grid["yen_training_episodes"], grid["yen_training_days"] = yen_eps, yen_days
+    grid["episode_diff"] = (grid["training_episodes"] - yen_eps).abs()
+    grid["day_diff"] = (grid["training_days"] - yen_days).abs()
+    # DEVIATIONS.md, day cap: only thresholds firing on at most 2x S_yen's training days are eligible.
+    grid["eligible"] = grid["training_days"] <= DAY_CAP_MULT * yen_days
+    q_v2, q_e2 = pick_secondary(grid, "vix_change5", True), pick_secondary(grid, "equity", False)
+    grid["chosen"] = (((grid["signal"] == "vix_change5") & (grid["q"] == q_v2))
+                      | ((grid["signal"] == "equity") & (grid["q"] == q_e2)))
+    return q_v2, q_e2, grid
+
+
+def competing_secondary(d: pd.DataFrame, q_v2: float, q_e2: float) -> pd.DataFrame:
+    """DEVIATIONS.md, secondary comparison: 5-day VIX change above, S&P 500 5-day return below."""
+    vix5, spx5 = vix_change5(d), spx_ret5(d)
+    out = pd.DataFrame(index=d.index)
+    out["vix_change5"] = vix5
+    out["vix_change5_pct2"] = expanding_pct(vix5, q_v2)
+    out["spx_ret5_pct2"] = expanding_pct(spx5, q_e2)
+    late = out.index >= ANALYSIS_START
+    out["S_vix2"] = (vix5 > out["vix_change5_pct2"]).astype("Int8").where(late)
+    out["S_eq2"] = (spx5 < out["spx_ret5_pct2"]).astype("Int8").where(late)
+    return out
+
+
+def compute(d: pd.DataFrame, q_v: int | None = None, q_e: int | None = None, q_v2: float | None = None,
+            q_e2: float | None = None) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
+    """All section 6 signals plus the secondary comparison signals. Returns (signals, primary grid,
+    secondary grid). If thresholds are given, that calibration is skipped (used by tests)."""
     out = pd.DataFrame(index=d.index)
     out["yen_move5"], out["yen_move5_long_window"] = yen_move(d)
     out["yen_vol20"] = yen_vol(d)
@@ -173,18 +243,25 @@ def compute(d: pd.DataFrame, q_v: int | None = None, q_e: int | None = None) -> 
     out = out.join(competing(d, q_v, q_e))
     out["q_v"], out["q_e"] = q_v, q_e
 
-    for name in ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq"]:
+    grid2 = None
+    if q_v2 is None or q_e2 is None:
+        q_v2, q_e2, grid2 = calibrate_secondary(d, out["S_yen"])
+    out = out.join(competing_secondary(d, q_v2, q_e2))
+    out["q_v2"], out["q_e2"] = q_v2, q_e2
+
+    for name in ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq", "S_vix2", "S_eq2"]:
         out[f"{name}_episode"], out[f"{name}_episode_start"] = episodes(out[name])
-    return out, grid
+    return out, grid, grid2
 
 
 def main() -> None:
     d = pd.read_csv(ALIGNED, index_col="date", parse_dates=["date"])
-    out, grid = compute(d)
+    out, grid, grid2 = compute(d)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     CALIBRATION.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(OUT, date_format="%Y-%m-%d")
     grid.to_csv(CALIBRATION, index=False, float_format="%.6f")
+    grid2.to_csv(CALIBRATION_SECONDARY, index=False)
 
     train = (out.index >= TRAIN_START) & (out.index <= TRAIN_END)
     chosen = grid[grid["chosen"]].set_index("signal")
@@ -192,10 +269,16 @@ def main() -> None:
     print(f"  S_yen fires on {out.loc[train, 'S_yen'].astype(float).mean():.4f} of training days")
     for sig, q in [("vix", out['q_v'].iloc[0]), ("equity", out['q_e'].iloc[0])]:
         print(f"  {sig}: q = {q}, training frequency {chosen.loc[sig, 'training_freq']:.4f}")
+    chosen2 = grid2[grid2["chosen"]].set_index("signal")
+    print(f"Secondary comparison (training only): S_yen has {int(grid2['yen_training_episodes'].iloc[0])} episodes, "
+          f"{int(grid2['yen_training_days'].iloc[0])} days")
+    for sig in ["vix_change5", "equity"]:
+        r = chosen2.loc[sig]
+        print(f"  {sig}: q = {r['q']}, {int(r['training_episodes'])} episodes, {int(r['training_days'])} days")
     print(f"Flags: signal_unavailable {int(out['signal_unavailable'].sum())} days, "
           f"yen_move5_long_window {int(out.loc[out.index >= ANALYSIS_START, 'yen_move5_long_window'].sum())} days "
           f"(from {ANALYSIS_START.date()})")
-    print(f"Wrote {OUT.relative_to(ROOT)} and {CALIBRATION.relative_to(ROOT)}")
+    print(f"Wrote {OUT.relative_to(ROOT)}, {CALIBRATION.relative_to(ROOT)} and {CALIBRATION_SECONDARY.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
