@@ -1,0 +1,22 @@
+{
+  "run_commit": "8ed7dcf92101202c724bcf147e951798c6cd14ce",
+  "run_utc": "2026-10-19T13:59:35Z",
+  "numpy": "2.1.0",
+  "pandas": "2.2.2",
+  "random_timing": {
+    "sims": 1000,
+    "seed": 42
+  },
+  "bootstrap": {
+    "reps": 2000,
+    "mean_block": 20,
+    "seed": 42
+  },
+  "outputs": [
+    "tables/h3_metrics.csv",
+    "tables/h3_random_timing.csv",
+    "tables/h3_bootstrap.csv",
+    "tables/h3_sensitivity.csv",
+    "tables/h3_verdict.csv"
+  ]
+}

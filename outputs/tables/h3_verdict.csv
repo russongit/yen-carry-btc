@@ -1,0 +1,4 @@
+comparison,sharpe_yen,sharpe_competitor,random_p90,yen_episodes,competitor_episodes,pass
+primary,1.1725469577472831,1.2352597114643882,1.3181504218014177,11.0,1.0,False
+secondary,1.1725469577472831,1.2206950331279434,1.3181504218014177,11.0,3.0,False
+combined (both must pass),,,,,,False
