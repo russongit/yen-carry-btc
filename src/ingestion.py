@@ -20,11 +20,13 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html
 import io
 import json
+import re
 import time
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -66,7 +68,30 @@ JGB_FILES = {
 JGB_HEADER = ["Date", "1Y", "2Y", "3Y", "4Y", "5Y", "6Y", "7Y", "8Y", "9Y", "10Y", "15Y", "20Y", "25Y", "30Y", "40Y"]
 CFTC_FILES = ["fin_fut_txt_2006_2016.zip"] + [f"fut_fin_txt_{y}.zip" for y in range(2017, 2027)]
 CFTC_URL = "https://www.cftc.gov/files/dea/history/"
+MONTHS = {m: i for i, m in enumerate(["January", "February", "March", "April", "May", "June", "July",
+                                      "August", "September", "October", "November", "December"], 1)}
 CFTC_YEN_CODE = "097741"
+
+# Section 5 rule 9: COT is usable from the first trading day after its actual release date.
+# The TFF files carry only the as-of date, so release dates come from CFTC's release
+# schedule page (archived copies for past years; the live page lists only the current year)
+# and from CFTC press releases for disrupted periods.
+COT_SCHEDULE_URL = "https://www.cftc.gov/MarketReports/CommitmentsofTraders/ReleaseSchedule/index.htm"
+COT_SCHEDULE_SNAPSHOTS = ["20150515", "20160520", "20170602", "20180413", "20190716", "20200727",
+                          "20210618", "20220523", "20230929", "20240625", "20250617"]
+COT_PRESS_RELEASES = ["7864-19", "8655-23", "8662-23", "9138-25", "9147-25"]
+# Disrupted periods where the published schedule does not hold. Reports with as-of dates in
+# these windows need a release date from a press release, or they are unresolved.
+COT_DISRUPTIONS = [
+    # 2018-19 lapse in appropriations. 7864-19 gives only a cadence (first release Fri 2019-02-01,
+    # then one Tuesday and one Friday each week until current), not dates.
+    ("2018-12-24", "2019-03-05", "7864-19"),
+    # ION cyber incident. 8662-23 says catch-up begins with the report originally due 2023-02-03
+    # and finishes "by mid-March", without dates.
+    ("2023-01-31", "2023-03-14", "8662-23"),
+    # 2025 lapse in appropriations. 9147-25 (latest revision of 9138-25) lists every new date.
+    ("2025-09-30", "2025-12-23", "9147-25"),
+]
 
 COINBASE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
@@ -178,6 +203,124 @@ def fetch_cftc(manifest: dict, refresh: bool) -> None:
         r = _get(CFTC_URL + name, timeout=120)
         save_raw(path, r.content, "CFTC TFF futures only", CFTC_URL + name, manifest)
         print(f"  saved {path.relative_to(ROOT)}")
+
+
+def fetch_cot_release(manifest: dict, refresh: bool) -> None:
+    folder = RAW / "cftc_release"
+    sources = [(f"schedule_{ts}.html", f"https://web.archive.org/web/{ts}id_/{COT_SCHEDULE_URL}", "Wayback Machine copy of CFTC COT release schedule")
+               for ts in COT_SCHEDULE_SNAPSHOTS]
+    sources.append((f"schedule_live_{datetime.now(timezone.utc):%Y%m%d}.html", COT_SCHEDULE_URL, "CFTC COT release schedule"))
+    sources += [(f"press_{p}.html", f"https://www.cftc.gov/PressRoom/PressReleases/{p}", "CFTC press release")
+                for p in COT_PRESS_RELEASES]
+    for name, url, source in sources:
+        if name.startswith("schedule_live") and any(folder.glob("schedule_live_*.html")) and not refresh:
+            continue
+        path = folder / name
+        if path.exists() and not refresh:
+            continue
+        r = _get(url, timeout=120, tries=6)
+        save_raw(path, r.content, source, url, manifest)
+        print(f"  saved {path.relative_to(ROOT)}")
+        if "web.archive.org" in url:
+            time.sleep(8)  # the Wayback Machine refuses rapid requests
+
+
+def _page_text(raw: bytes) -> str:
+    t = re.sub(r"<[^>]+>", " ", raw.decode("utf-8", errors="replace"))
+    return re.sub(r"\s+", " ", html.unescape(t).replace("\xa0", " "))
+
+
+def parse_schedule(raw: bytes) -> list[date]:
+    """Release dates from one copy of the release schedule page (year, month, then day numbers)."""
+    t = _page_text(raw)
+    i, j = t.find("tentative schedule"), t.find("*Delayed")
+    if i < 0 or j < i:
+        raise SourceError("CFTC release schedule: no schedule table found")
+    seg = t[i:j].split(".", 1)[1]  # drop the sentence ending "through YYYY."
+    out, year, month = [], None, None
+    for tok in seg.split():
+        if re.fullmatch(r"20\d\d", tok):
+            year, month = int(tok), None
+        elif tok in MONTHS:
+            month = MONTHS[tok]
+        elif re.fullmatch(r"\d{1,2}\*{0,2}", tok) and year and month:  # "*" holiday delay, "**" Monday data
+            out.append(date(year, month, int(tok.rstrip("*"))))
+    return out
+
+
+def parse_press_schedule(raw: bytes) -> dict[date, date]:
+    """As-of date -> new publish date, from a press release table of (as-of, original, new) dates."""
+    t = _page_text(raw)
+    triples = re.findall(r"(\d\d/\d\d/\d{4}) (\d\d/\d\d/\d{4}) (\d\d/\d\d/\d{4})", t)
+    to_date = lambda s: datetime.strptime(s, "%m/%d/%Y").date()
+    return {to_date(a): to_date(n) for a, _, n in triples}
+
+
+def load_cot_yen() -> pd.DataFrame:
+    """Raw yen rows from every TFF file, with the as-of date parsed."""
+    frames = []
+    for name in CFTC_FILES:
+        with zipfile.ZipFile(RAW / "cftc_tff" / name) as z:
+            with z.open(z.namelist()[0]) as f:
+                df = pd.read_csv(io.TextIOWrapper(f, encoding="latin-1"), dtype=str, low_memory=False)
+        df.columns = [c.strip() for c in df.columns]
+        df = df[df["CFTC_Contract_Market_Code"].str.strip() == CFTC_YEN_CODE].copy()
+        raw_dates = df["Report_Date_as_YYYY-MM-DD"].str.strip()
+        # The 2006-2016 file writes this column as "12/27/2016 12:00:00 AM" despite its name.
+        dates = pd.to_datetime(raw_dates, format="%Y-%m-%d", errors="coerce").fillna(
+            pd.to_datetime(raw_dates, format="%m/%d/%Y %I:%M:%S %p", errors="coerce"))
+        if dates.isna().any():
+            raise SourceError(f"CFTC {name}: unparseable report dates {raw_dates[dates.isna()].tolist()[:3]}")
+        df["as_of"] = dates.dt.date
+        frames.append(df)
+    return pd.concat(frames).drop_duplicates("as_of").sort_values("as_of").reset_index(drop=True)
+
+
+def cot_release_dates(first_as_of: str = "2014-12-23", last_as_of: str = SAMPLE_END) -> tuple[dict, list, list]:
+    """Map each yen as-of date to its release date. Returns (resolved, excluded, unresolved).
+
+    excluded: reports in a disrupted period whose press release gives no date. Per DEVIATIONS.md
+    (2026-10-19) they are never usable; COT_net keeps the last released report.
+    unresolved: anything else without a release date, which must stop the run.
+    """
+    folder = RAW / "cftc_release"
+    scheduled: set[date] = set()
+    for f in sorted(folder.glob("schedule_*.html")):
+        scheduled.update(parse_schedule(f.read_bytes()))
+    overrides: dict[date, date] = {}
+    for f in sorted(folder.glob("press_*.html")):
+        overrides.update(parse_press_schedule(f.read_bytes()))
+
+    as_of = [d for d in load_cot_yen()["as_of"]
+             if date.fromisoformat(first_as_of) <= d <= date.fromisoformat(last_as_of)]
+    windows = [(date.fromisoformat(a), date.fromisoformat(b), src) for a, b, src in COT_DISRUPTIONS]
+    resolved, excluded, unresolved = {}, [], []
+    releases = sorted(scheduled)
+    for d in as_of:
+        window = next((w for w in windows if w[0] <= d <= w[1]), None)
+        if window:
+            if d in overrides:
+                resolved[d] = (overrides[d], f"press release {window[2]}")
+            else:
+                excluded.append((d, f"disrupted period, no date in press release {window[2]}"))
+            continue
+        # Normal weeks: the first scheduled release after the as-of date, within 10 days.
+        nxt = next((r for r in releases if d < r <= d + timedelta(days=10)), None)
+        if nxt is None:
+            unresolved.append((d, "no scheduled release within 10 days"))
+        else:
+            resolved[d] = (nxt, "release schedule")
+
+    # Two normal-week reports must never share one release date.
+    by_release: dict[date, list] = {}
+    for d, (r, src) in resolved.items():
+        by_release.setdefault(r, []).append(d)
+    for r, ds in by_release.items():
+        if len(ds) > 1:
+            for d in ds:
+                resolved.pop(d)
+                unresolved.append((d, f"shares release date {r} with another report"))
+    return resolved, sorted(excluded), sorted(unresolved)
 
 
 def _paged_hours(start: datetime, end: datetime, step_hours: int):
@@ -323,21 +466,7 @@ def summarize(btc_source: str) -> pd.DataFrame:
     jgb = pd.concat(frames).drop_duplicates("Date").sort_values("Date")
     rows.append(_summary_row("MoF JGB combined (2Y)", jgb, "Date", "2Y"))
 
-    cftc = []
-    for name in CFTC_FILES:
-        with zipfile.ZipFile(RAW / "cftc_tff" / name) as z:
-            with z.open(z.namelist()[0]) as f:
-                df = pd.read_csv(io.TextIOWrapper(f, encoding="latin-1"), dtype=str, low_memory=False)
-        code_col = next(c for c in df.columns if c.strip().lower() == "cftc_contract_market_code")
-        date_col = next(c for c in df.columns if c.strip().lower() == "report_date_as_yyyy-mm-dd")
-        yen_rows = df.loc[df[code_col].str.strip() == CFTC_YEN_CODE, date_col].str.strip()
-        # The 2006-2016 file writes this column as "12/27/2016 12:00:00 AM" despite its name.
-        dates = pd.to_datetime(yen_rows, format="%Y-%m-%d", errors="coerce").fillna(
-            pd.to_datetime(yen_rows, format="%m/%d/%Y %I:%M:%S %p", errors="coerce"))
-        if dates.isna().any():
-            raise SourceError(f"CFTC {name}: unparseable report dates {yen_rows[dates.isna()].tolist()[:3]}")
-        cftc.append(pd.DataFrame({"date": dates}))
-    yen = pd.concat(cftc).drop_duplicates()
+    yen = load_cot_yen()[["as_of"]].rename(columns={"as_of": "date"})
     yen["value"] = 0
     rows.append(_summary_row(f"CFTC TFF yen ({CFTC_YEN_CODE}) reports", yen, "date", "value"))
 
@@ -372,7 +501,8 @@ def main() -> None:
     manifest = _load_manifest()
     try:
         for label, fn in [("FRED", fetch_fred), ("MoF JGB", fetch_jgb), ("yfinance", fetch_yfinance),
-                          ("CFTC TFF", fetch_cftc), ("Coinbase", fetch_coinbase), ("Binance", fetch_binance)]:
+                          ("CFTC TFF", fetch_cftc), ("CFTC release dates", fetch_cot_release),
+                          ("Coinbase", fetch_coinbase), ("Binance", fetch_binance)]:
             print(f"{label}:")
             fn(manifest, args.refresh)
             _write_manifest(manifest)
@@ -399,6 +529,19 @@ def main() -> None:
     with pd.option_context("display.width", 200, "display.max_columns", 10):
         print(summarize(btc_source).to_string(index=False))
     print(f"\nManifest: {MANIFEST.relative_to(ROOT)} ({len(manifest)} files)")
+
+    print("\nCOT release dates (section 5 rule 9):")
+    resolved, excluded, unresolved = cot_release_dates()
+    sources = pd.Series([src for _, src in resolved.values()]).value_counts()
+    print(f"  {len(resolved)} yen reports resolved: " + ", ".join(f"{n} from {s}" for s, n in sources.items()))
+    print(f"  {len(excluded)} report(s) never usable (no published release date; see DEVIATIONS.md):")
+    for d, why in excluded:
+        print(f"    as-of {d}: {why}")
+    if unresolved:
+        print(f"  STOP: {len(unresolved)} report(s) have no release date:")
+        for d, why in unresolved:
+            print(f"    as-of {d}: {why}")
+        raise SourceError("COT release dates incomplete; decide how to handle the reports above before alignment")
 
 
 if __name__ == "__main__":
