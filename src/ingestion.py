@@ -323,6 +323,146 @@ def cot_release_dates(first_as_of: str = "2014-12-23", last_as_of: str = SAMPLE_
     return resolved, sorted(excluded), sorted(unresolved)
 
 
+# ---------------------------------------------------------------- event-study sources (DEVIATIONS.md, event-study G, H, J)
+
+MOF_INTERVENTION_URL = ("https://www.mof.go.jp/english/policy/international_policy/reference/feio/"
+                        "foreign_exchange_intervention_operations.csv")
+BOJ_INDEX_URL = "https://www.boj.or.jp/en/mopo/mpmdeci/state_{year}/index.htm"
+BOJ_YEARS = range(2018, 2027)
+FED_URL = "https://www.federalreserve.gov/monetarypolicy/"
+FOMC_HISTORICAL_YEARS = (2018, 2019, 2020)  # earlier years leave the current calendar page
+
+
+def fetch_mof_intervention(manifest: dict, refresh: bool) -> None:
+    """Decision G. MoF's historical file grows each quarter, so each download is kept under its date;
+    a later vintage (for example, after the July to September 2026 release) is a new raw file."""
+    folder = RAW / "mof_intervention"
+    if any(folder.glob("foreign_exchange_intervention_operations_*.csv")) and not refresh:
+        return
+    r = _get(MOF_INTERVENTION_URL, timeout=120)
+    path = folder / f"foreign_exchange_intervention_operations_{datetime.now(timezone.utc):%Y%m%d}.csv"
+    save_raw(path, r.content, "MoF foreign exchange intervention historical data", MOF_INTERVENTION_URL, manifest)
+    print(f"  saved {path.relative_to(ROOT)}")
+
+
+def parse_boj_index(raw: bytes) -> list[dict]:
+    """(date, title, href) rows from a BoJ "Statements on Monetary Policy" yearly index page."""
+    s = raw.decode("utf-8", errors="replace")
+    body = s[s.find("[START] LIST_1"):s.find("[END] LIST_1")]
+    rows = []
+    for d, t in re.findall(r"<td>(.*?)</td>\s*<td>(.*?)</td>", body, re.S):
+        d = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", d)).replace("\xa0", " ")).strip()
+        href = re.search(r'href="([^"]+)"', t)
+        title = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", t)).replace("\xa0", " ")).strip()
+        date_ = datetime.strptime(d.replace("Sept.", "Sep.").replace(".", ""), "%b %d, %Y").date() if "." in d \
+            else datetime.strptime(d, "%B %d, %Y").date()
+        rows.append({"date": date_, "title": title, "href": href.group(1) if href else ""})
+    return rows
+
+
+def fetch_boj_statements(manifest: dict, refresh: bool) -> None:
+    """Decision H. Yearly index pages for 2018 to 2026 and every statement they list (HTML or PDF),
+    since many titles are generic and the classification needs the statement text."""
+    folder = RAW / "boj_statements"
+    for year in BOJ_YEARS:
+        path = folder / f"index_{year}.htm"
+        url = BOJ_INDEX_URL.format(year=year)
+        if not path.exists() or refresh:
+            save_raw(path, _get(url).content, "BoJ Statements on Monetary Policy index", url, manifest)
+            time.sleep(1)
+        for row in parse_boj_index(path.read_bytes()):
+            if not row["href"]:
+                continue
+            doc = folder / "docs" / row["href"].rsplit("/", 1)[1]
+            if doc.exists() and not refresh:
+                continue
+            doc_url = "https://www.boj.or.jp" + row["href"]
+            save_raw(doc, _get(doc_url, timeout=120).content, "BoJ monetary policy statement", doc_url, manifest)
+            time.sleep(1)
+    print(f"  BoJ statements: {len(list((folder / 'docs').glob('*')))} documents")
+
+
+def fetch_fomc_calendar(manifest: dict, refresh: bool) -> None:
+    """Decision J. The current calendar page (2021 on) changes over time, so it is kept under its
+    download date; 2018 to 2020 come from the historical pages."""
+    folder = RAW / "fomc"
+    if not any(folder.glob("fomccalendars_*.htm")) or refresh:
+        url = FED_URL + "fomccalendars.htm"
+        path = folder / f"fomccalendars_{datetime.now(timezone.utc):%Y%m%d}.htm"
+        save_raw(path, _get(url).content, "Federal Reserve FOMC meeting calendar", url, manifest)
+    for year in FOMC_HISTORICAL_YEARS:
+        path = folder / f"fomchistorical{year}.htm"
+        if not path.exists() or refresh:
+            url = FED_URL + f"fomchistorical{year}.htm"
+            save_raw(path, _get(url).content, "Federal Reserve FOMC historical meetings", url, manifest)
+    print(f"  FOMC: {len(list(folder.glob('*.htm')))} pages")
+
+
+_MONTHS_ALL = {m: i for i, m in enumerate(["January", "February", "March", "April", "May", "June", "July", "August",
+                                           "September", "October", "November", "December"], 1)}
+_MONTH_ABBR = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6, "Jul": 7, "Aug": 8, "Sep": 9,
+               "Oct": 10, "Nov": 11, "Dec": 12}
+
+
+def _fomc_last_day(year: int, month_label: str, days: str) -> date:
+    """Decision day = the last day of the meeting. Labels like "Apr/May" with "30-1" end in the later month."""
+    last = int(re.findall(r"\d+", days)[-1])
+    months = month_label.split("/")
+    m = _MONTHS_ALL.get(months[-1]) or _MONTH_ABBR[months[-1][:3]]
+    return date(year, m, last)
+
+
+def parse_fomc() -> pd.DataFrame:
+    """FOMC decision days with type (scheduled, unscheduled, notation vote), 2018 to 2026."""
+    folder = RAW / "fomc"
+    rows = []
+    current = sorted(folder.glob("fomccalendars_*.htm"))[-1].read_text(encoding="utf-8", errors="replace")
+    for year, block in re.findall(r"<h4>(?:<a[^>]*>)?(\d{4}) FOMC Meetings(.*?)(?=<h4>(?:<a[^>]*>)?\d{4} FOMC Meetings|$)",
+                                  current, re.S):
+        months = re.findall(r'fomc-meeting__month[^>]*>\s*<strong>([^<]+)</strong>', block)
+        days = [d.strip() for d in re.findall(r'fomc-meeting__date[^>]*>([^<]+)<', block)]
+        for m, d in zip(months, days):
+            kind = "notation vote" if "notation" in d else "unscheduled" if "unscheduled" in d else "scheduled"
+            rows.append({"date": _fomc_last_day(int(year), m, d), "type": kind, "label": f"{m} {d}"})
+    for year in FOMC_HISTORICAL_YEARS:
+        t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", (folder / f"fomchistorical{year}.htm")
+                                                       .read_text(encoding="utf-8", errors="replace"))))
+        for m, d, unsched in re.findall(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* "
+                                        r"(\d{1,2}(?:-\d{1,2})?)( \(unscheduled\))?"
+                                        r"(?: Meeting| Conference Call)? - " + str(year), t):
+            # On these pages the month label is the meeting's last month: "May 30-1" is April 30 to May 1.
+            rows.append({"date": date(year, _MONTH_ABBR[m], int(d.split("-")[-1])),
+                         "type": "unscheduled" if unsched else "scheduled", "label": f"{m} {d}{unsched}"})
+    df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date")
+    return df[(df["date"] >= date(2018, 1, 1)) & (df["date"] <= date(2026, 12, 31))].reset_index(drop=True)
+
+
+def parse_mof_intervention(path: Path) -> tuple[pd.DataFrame, date]:
+    """Daily intervention rows (date, amount in 100 million yen, currency pair) and the last day the file
+    covers (the end of the last quarter with a quarterly total row)."""
+    text = path.read_bytes().decode("cp932")
+    rows, year, month = [], None, None
+    quarter_end = None
+    months_en = {m[:3]: i for m, i in _MONTHS_ALL.items()}
+    for rec in csv.reader(io.StringIO(text)):
+        rec += [""] * (9 - len(rec))
+        q = re.match(r"(January|April|July|October) - (March|June|September|December) (\d{4})", rec[3])
+        if q:
+            end_m = _MONTHS_ALL[q.group(2)]
+            quarter_end = date(int(q.group(3)), end_m, 31 if end_m in (3, 12) else 30)
+            continue
+        if rec[3].strip().isdigit():
+            year = int(rec[3])
+        if rec[4].strip()[:3] in months_en:
+            month = months_en[rec[4].strip()[:3]]
+        if rec[5].strip().isdigit() and year and month and rec[6].strip():
+            rows.append({"date": date(year, month, int(rec[5])), "amount_100m_yen": int(rec[6].replace(",", "")),
+                         "pair": rec[8].strip()})
+    if quarter_end is None:
+        raise SourceError(f"{path.name}: no quarterly total rows found")
+    return pd.DataFrame(rows), quarter_end
+
+
 def _paged_hours(start: datetime, end: datetime, step_hours: int):
     t = start
     while t < end:
@@ -502,7 +642,9 @@ def main() -> None:
     try:
         for label, fn in [("FRED", fetch_fred), ("MoF JGB", fetch_jgb), ("yfinance", fetch_yfinance),
                           ("CFTC TFF", fetch_cftc), ("CFTC release dates", fetch_cot_release),
-                          ("Coinbase", fetch_coinbase), ("Binance", fetch_binance)]:
+                          ("Coinbase", fetch_coinbase), ("Binance", fetch_binance),
+                          ("MoF intervention", fetch_mof_intervention), ("BoJ statements", fetch_boj_statements),
+                          ("FOMC calendar", fetch_fomc_calendar)]:
             print(f"{label}:")
             fn(manifest, args.refresh)
             _write_manifest(manifest)
