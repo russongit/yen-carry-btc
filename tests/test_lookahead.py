@@ -20,6 +20,10 @@ import alignment as al  # noqa: E402
 import ingestion as ing  # noqa: E402
 
 SCRAMBLE = 1.37  # multiplier applied to every value known only after the cutoff
+# One aligned column per raw input source: FRED, Yahoo, MoF, Bitstamp, Binance, CFTC.
+SCRAMBLED_SOURCES = ["DEXJPUS", "DEXUSEU", "DEXUSUK", "DEXCAUS", "DEXSDUS", "DEXSZUS", "DTWEXBGS",
+                     "US2Y", "US10Y", "US3M", "SPX", "VIX", "ACWI", "FXY", "JP2Y",
+                     "BTC_noon", "BTC_close", "BTC_1700", "BTCB_noon", "BTCB_close", "BTCB_1700", "COT_net"]
 
 
 @pytest.fixture(scope="module")
@@ -84,11 +88,11 @@ def test_future_data_does_not_change_past(baseline, monkeypatch, cutoff):
     cutoff = pd.Timestamp(cutoff)
     scrambled = _scrambled_build(monkeypatch, cutoff)
     past = baseline.index <= cutoff
-    pd.testing.assert_frame_equal(baseline.loc[past], scrambled.loc[past])
-    # The scramble must actually reach the future, or the test proves nothing.
+    pd.testing.assert_frame_equal(baseline.loc[past], scrambled.loc[past], check_exact=True)
+    # The scramble must reach every input source, or the test proves nothing for that source.
     future = baseline.index > cutoff
-    assert not baseline.loc[future, "DEXJPUS"].equals(scrambled.loc[future, "DEXJPUS"])
-    assert not baseline.loc[future, "BTC_1700"].equals(scrambled.loc[future, "BTC_1700"])
+    for col in SCRAMBLED_SOURCES:
+        assert not baseline.loc[future, col].equals(scrambled.loc[future, col]), f"scramble did not reach {col}"
 
 
 def _truncated_build(monkeypatch, cutoff: pd.Timestamp) -> pd.DataFrame:
@@ -129,7 +133,7 @@ def test_truncated_run_matches_full_run(baseline, monkeypatch, cutoff):
     cutoff = pd.Timestamp(cutoff)
     truncated = _truncated_build(monkeypatch, cutoff)
     assert truncated.index.max() == cutoff
-    pd.testing.assert_frame_equal(baseline.loc[:cutoff], truncated)
+    pd.testing.assert_frame_equal(baseline.loc[:cutoff], truncated, check_exact=True)
 
 
 # ---------------------------------------------------------------- 2. BTC sampling
@@ -164,18 +168,22 @@ PINNED_BTC = [
 
 @pytest.mark.parametrize("day, column, value, candle_open_utc", PINNED_BTC)
 def test_btc_pinned_spot_check_values(baseline, day, column, value, candle_open_utc):
+    """Expected values are the spot-checked closes (docs/spot_check.md), hard-coded here."""
     assert baseline.loc[day, column] == value
-    candle = al.load_bitstamp().loc[pd.Timestamp(candle_open_utc, tz="UTC")]
-    assert candle["close"] == value and candle["volume"] > 0
+    hour = {"BTC_noon": 11, "BTC_close": 15, "BTC_1700": 16}[column]
+    expected_open = pd.Timestamp(f"{day} {hour:02d}:00", tz=al.NY).tz_convert("UTC")
+    assert expected_open == pd.Timestamp(candle_open_utc, tz="UTC")
 
 
-def test_btc_ignores_the_candle_after_target():
-    hourly = _hourly("2024-08-04", "2024-08-07")
-    days = pd.DatetimeIndex(["2024-08-05"])
-    before, _, _ = al.sample_btc(hourly, days, 17)
-    after_open = pd.Timestamp("2024-08-05 17:00", tz=al.NY).tz_convert("UTC")
-    hourly.loc[hourly.index >= after_open, "close"] *= SCRAMBLE
-    after, _, _ = al.sample_btc(hourly, days, 17)
+@pytest.mark.parametrize("target", [12, 16, 17])
+@pytest.mark.parametrize("day", ["2024-08-05", "2018-01-02"])
+def test_btc_ignores_candles_from_target_onward(target, day):
+    hourly = _hourly("2017-12-30", "2018-01-04") if day.startswith("2018") else _hourly("2024-08-04", "2024-08-07")
+    days = pd.DatetimeIndex([day])
+    before, _, _ = al.sample_btc(hourly, days, target)
+    target_utc = pd.Timestamp(f"{day} {target:02d}:00", tz=al.NY).tz_convert("UTC")
+    hourly.loc[hourly.index >= target_utc, "close"] *= SCRAMBLE  # the candle opening at T and everything later
+    after, _, _ = al.sample_btc(hourly, days, target)
     assert before.equals(after)
 
 
@@ -204,6 +212,21 @@ def test_fx_missing_fixing_is_blank_not_zero():
     assert not spans["2024-10-11"]
 
 
+# r_dxyx computed from the H.10 noon rates for 2024-08-05 to 2024-08-09 typed in
+# tests/verify_dxyx_formula.py, with the section 4 weights; independent of the FRED files.
+PINNED_DXYX = {
+    "2024-08-06": 0.0022843389556390613,
+    "2024-08-07": -0.0004361586255433554,
+    "2024-08-08": 0.000902187556346464,
+    "2024-08-09": -0.0012550694558881796,
+}
+
+
+@pytest.mark.parametrize("day, value", PINNED_DXYX.items())
+def test_r_dxyx_matches_h10_values(baseline, day, value):
+    assert baseline.loc[day, "r_dxyx"] == pytest.approx(value, rel=1e-12, abs=0)
+
+
 def test_fx_real_data_missing_days_are_blank(baseline):
     flagged = baseline[baseline["fx_missing"]]
     assert len(flagged) > 0
@@ -230,9 +253,10 @@ def test_closed_days_have_zero_change(baseline):
 
 def test_lagged_columns_use_previous_day_only(baseline):
     b = baseline
-    pd.testing.assert_series_equal(b["dJP2Y_lag1"].iloc[1:], b["dJP2Y"].shift(1).iloc[1:], check_names=False)
+    pd.testing.assert_series_equal(b["dJP2Y_lag1"].iloc[1:], b["dJP2Y"].shift(1).iloc[1:], check_names=False,
+                                   check_exact=True)
     expected = (b["US2Y"] - b["JP2Y"]).shift(1)
-    pd.testing.assert_series_equal(b["spread_lag1"].iloc[1:], expected.iloc[1:], check_names=False)
+    pd.testing.assert_series_equal(b["spread_lag1"].iloc[1:], expected.iloc[1:], check_names=False, check_exact=True)
 
 
 # ---------------------------------------------------------------- 5. COT (rule 9)
@@ -266,7 +290,9 @@ SIGNAL_STATS = ["yen_move5", "yen_vol20", "yen_vol20_pct80", "yen_move5_pct90", 
                 "yen_move5_pct95", "spx_ret5", "vix_pct", "spx_ret5_pct",
                 "vix_change5", "vix_change5_pct2", "spx_ret5_pct2"]
 SIGNAL_OUTPUTS = ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq", "S_vix2", "S_eq2", "signal_unavailable",
-                  "S_yen_episode", "S_vix_episode", "S_eq_episode", "S_vix2_episode", "S_eq2_episode"]
+                  "yen_move5_long_window"]
+for _name in ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq", "S_vix2", "S_eq2"]:
+    SIGNAL_OUTPUTS += [f"{_name}_episode", f"{_name}_episode_start"]
 
 
 @pytest.fixture(scope="module")
@@ -288,7 +314,7 @@ def signals_truncated(baseline, signals_full):
 def test_signal_statistic_uses_data_through_t_only(signals_full, signals_truncated, column, cutoff):
     """One test per rolling or expanding statistic: a run cut off at t reproduces every value up to t."""
     full = signals_full[0].loc[:cutoff, column]
-    pd.testing.assert_series_equal(full, signals_truncated[cutoff][column])
+    pd.testing.assert_series_equal(full, signals_truncated[cutoff][column], check_exact=True)
 
 
 def test_expanding_percentile_matches_numpy_through_t(signals_full):
@@ -299,12 +325,35 @@ def test_expanding_percentile_matches_numpy_through_t(signals_full):
 
 
 def test_calibration_ignores_test_period(baseline, signals_full):
-    """Scrambling VIX and S&P 500 after the training period must not change q_V, q_E, or the grid."""
+    """Scrambling VIX, S&P 500 and the yen inputs after the training period must not change q_V, q_E, or the grid."""
     d = baseline.copy()
     after = d.index > sg.TRAIN_END
-    d.loc[after, ["VIX", "SPX"]] *= SCRAMBLE
+    d.loc[after, ["VIX", "SPX", "DEXJPUS", "r_yen"]] *= SCRAMBLE
     _, grid, _ = sg.compute(d)
-    pd.testing.assert_frame_equal(grid, signals_full[1])
+    pd.testing.assert_frame_equal(grid, signals_full[1], check_exact=True)
+
+
+def test_calibration_on_data_cut_at_training_end_matches_full_run(baseline, signals_full):
+    """q_V, q_E, q_V2, q_E2 and both grids from data ending at the training end equal the full run."""
+    out, grid, grid2 = sg.compute(baseline.loc[:sg.TRAIN_END])
+    pd.testing.assert_frame_equal(grid, signals_full[1], check_exact=True)
+    pd.testing.assert_frame_equal(grid2, signals_full[2], check_exact=True)
+    for q in ["q_v", "q_e", "q_v2", "q_e2"]:
+        assert out[q].iloc[0] == signals_full[0][q].iloc[0]
+
+
+def test_vol_burn_in_on_real_data(baseline, signals_full):
+    """yen_vol20 is blank until 20 daily returns exist (approved burn-in rule)."""
+    first_vol = signals_full[0]["yen_vol20"].first_valid_index()
+    twentieth_return = baseline["r_yen"].dropna().index[19]
+    assert first_vol == twentieth_return
+
+
+def test_pick_primary_on_synthetic_ties():
+    grid = pd.DataFrame({"signal": ["vix"] * 3 + ["equity"] * 3, "q": [97, 98, 99, 1, 2, 3],
+                         "abs_diff": [0.02, 0.01, 0.01, 0.01, 0.01, 0.02]})
+    assert sg.pick_primary(grid, "vix", prefer_high=True) == 99
+    assert sg.pick_primary(grid, "equity", prefer_high=False) == 1
 
 
 def test_calibration_tie_break_prefers_fewer_firings(signals_full):
