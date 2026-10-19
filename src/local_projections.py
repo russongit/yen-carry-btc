@@ -269,3 +269,158 @@ def build_samples(subsample: str = "full", data: pd.DataFrame | None = None) -> 
     a = load() if data is None else data
     daily, weekly = daily_panel(a), weekly_panel(a)
     return {s.name: make_sample(s, daily, weekly, subsample) for s in registry(daily)}
+
+
+# ---------------------------------------------------------------- estimation
+
+import json  # noqa: E402
+import subprocess  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+
+import statsmodels.api as sm  # noqa: E402
+from scipy.stats import norm  # noqa: E402
+from statsmodels.stats.outliers_influence import variance_inflation_factor  # noqa: E402
+
+OUT_TABLES = ROOT / "outputs" / "tables"
+OUT_FIGURES = ROOT / "outputs" / "figures"
+RUN_MANIFEST = ROOT / "outputs" / "run_manifest.json"
+Z90 = norm.ppf(0.95)  # section 8.2: 90% confidence bands
+ALPHA = 0.05          # section 2: one-sided HAC p < 0.05
+
+# Section 2 pass criteria: (specification, coefficient, required sign). All are "less than zero".
+VERDICTS = {"H1a": ("H1a", "S_x_ryen"),           # gamma_0 < 0
+            "H1b": (f"H1b_h{H_TEST}", "S_x_ryen"),  # gamma_5 < 0
+            "H1d": ("H1d", "dJP2Y")}               # phi < 0
+
+
+def estimate(sample: Sample):
+    """Section 8 common rules with the pinned fit call (decision E). Returns the fitted results."""
+    X = sm.add_constant(sample.X, has_constant="add")
+    return sm.OLS(sample.y, X).fit(**fit_kwargs(sample.spec.h))
+
+
+def one_sided_p(res, term: str) -> tuple[float, float]:
+    """(p for coefficient < 0, p for coefficient > 0) from the HAC z-statistic (decision E)."""
+    z = res.params[term] / res.bse[term]
+    return float(norm.cdf(z)), float(norm.sf(z))
+
+
+def sum_se(res, a: str, b: str) -> float:
+    """Standard error of coef_a + coef_b: sqrt(Var a + Var b + 2 Cov(a, b)), HAC covariance."""
+    v = res.cov_params()
+    return float(np.sqrt(v.loc[a, a] + v.loc[b, b] + 2 * v.loc[a, b]))
+
+
+def used_maxlags(res) -> int:
+    return int(res.cov_kwds["maxlags"])
+
+
+def vifs(sample: Sample) -> pd.Series:
+    """Section 8 common rules: VIF for every regressor, constant excluded from the report."""
+    X = sm.add_constant(sample.X, has_constant="add").to_numpy()
+    return pd.Series([variance_inflation_factor(X, i) for i in range(1, X.shape[1])], index=sample.X.columns)
+
+
+def coefficient_table(sample: Sample, res, subsample: str) -> pd.DataFrame:
+    p_less, p_greater = zip(*(one_sided_p(res, t) for t in res.params.index))
+    t = pd.DataFrame({"spec": sample.spec.name, "group": sample.spec.group, "subsample": subsample,
+                      "term": res.params.index, "coef": res.params.values, "se_hac": res.bse.values,
+                      "z": res.tvalues.values, "p_two_sided": res.pvalues.values,
+                      "p_less": p_less, "p_greater": p_greater})
+    t["n"] = int(res.nobs)
+    t["maxlags"] = used_maxlags(res)
+    t["s_days"] = int(sample.X["S"].sum()) if "S" in sample.X else pd.NA  # section 8.2
+    t["vif"] = t["term"].map(vifs(sample)).astype(float)
+    t["fx_multi_day_dropped"] = len(sample.dropped_fx_multi_day)
+    return t
+
+
+def verdict(res, term: str) -> dict:
+    """Section 2: coefficient < 0 and one-sided p < 0.05 (raw p; Holm reported in the memo)."""
+    coef = float(res.params[term])
+    p_less, _ = one_sided_p(res, term)
+    return {"coef": coef, "p_one_sided": p_less, "pass": bool(coef < 0 and p_less < ALPHA)}
+
+
+def lp_bands(fits: dict) -> pd.DataFrame:
+    """Section 8.2 chart data: beta_h + gamma_h with 90% bands, h = 1 to 10."""
+    rows = []
+    for h in HORIZONS:
+        res = fits[f"H1b_h{h}"]
+        total = float(res.params["r_yen"] + res.params["S_x_ryen"])
+        se = sum_se(res, "r_yen", "S_x_ryen")
+        rows.append({"h": h, "beta_plus_gamma": total, "se": se,
+                     "lower90": total - Z90 * se, "upper90": total + Z90 * se})
+    return pd.DataFrame(rows)
+
+
+def run_commit() -> str:
+    """The commit the run comes from; refuses to run with uncommitted code."""
+    dirty = subprocess.run(["git", "status", "--porcelain", "--", "src", "tests", "DEVIATIONS.md"],
+                           cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    if dirty:
+        raise RuntimeError(f"Uncommitted changes; commit before the run:\n{dirty}")
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def check_first_run(manifest: Path = RUN_MANIFEST) -> None:
+    """The first run is the only run. A rerun after a fix must be a logged deviation that keeps
+    the original outputs in the git history, so it is never automatic."""
+    if manifest.exists():
+        raise RuntimeError(f"{manifest.name} exists: results have already been produced. "
+                           "Log a deviation (results seen) before any rerun.")
+
+
+def main() -> None:
+    check_first_run()
+    commit = run_commit()
+    a = load()
+    OUT_TABLES.mkdir(parents=True, exist_ok=True)
+    OUT_FIGURES.mkdir(parents=True, exist_ok=True)
+
+    tables, fits_full = [], {}
+    for sub in ["full", "train", "test"]:
+        for name, s in build_samples(sub, a).items():
+            res = estimate(s)
+            tables.append(coefficient_table(s, res, sub))
+            if sub == "full":
+                fits_full[name] = res
+    coef = pd.concat(tables, ignore_index=True)
+    coef.to_csv(OUT_TABLES / "regressions.csv", index=False)
+
+    verdicts = pd.DataFrame([{"hypothesis": hyp, "spec": spec, "term": term, **verdict(fits_full[spec], term)}
+                             for hyp, (spec, term) in VERDICTS.items()])
+    verdicts.to_csv(OUT_TABLES / "verdicts.csv", index=False)
+
+    bands = lp_bands(fits_full)
+    bands.to_csv(OUT_TABLES / "h1b_lp_bands.csv", index=False)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.fill_between(bands["h"], bands["lower90"], bands["upper90"], alpha=0.25, label="90% band (HAC)")
+    ax.plot(bands["h"], bands["beta_plus_gamma"], marker="o", label=r"$\beta_h + \gamma_h$")
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("h (trading days)")
+    ax.set_ylabel("BTC response to yen return in stress")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(OUT_FIGURES / "h1b_lp.png", dpi=150)
+
+    # Section 8.3: standard deviation of dJP2Y by calendar year, beside H1d.
+    d = daily_panel(a)
+    d["dJP2Y"].groupby(d.index.year).std().rename("sd_dJP2Y_bp").to_csv(OUT_TABLES / "jp2y_sd_by_year.csv")
+
+    manifest = {"run_commit": commit, "run_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "statsmodels": statsmodels.__version__, "pandas": pd.__version__, "numpy": np.__version__,
+                "n_specifications": len(fits_full),
+                "outputs": ["tables/regressions.csv", "tables/verdicts.csv", "tables/h1b_lp_bands.csv",
+                            "tables/jp2y_sd_by_year.csv", "figures/h1b_lp.png"]}
+    RUN_MANIFEST.write_text(json.dumps(manifest, indent=2))
+    print(verdicts.to_string(index=False))
+    print(f"Run commit {commit}; outputs listed in {RUN_MANIFEST.relative_to(ROOT)}")
+
+
+if __name__ == "__main__":
+    main()
