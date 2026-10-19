@@ -151,6 +151,24 @@ def test_btc_uses_close_of_candle_ending_at_target_across_dst():
     assert list(expected_utc.hour) == [21, 20]
 
 
+# Spot-checked Bitstamp values: (date, column, value, UTC open time of the candle whose close is used).
+PINNED_BTC = [
+    ("2024-08-05", "BTC_noon", 54385.0, "2024-08-05 15:00"),   # summer, EDT = UTC-4
+    ("2024-08-05", "BTC_close", 53483.0, "2024-08-05 19:00"),
+    ("2024-08-05", "BTC_1700", 54407.0, "2024-08-05 20:00"),
+    ("2018-01-02", "BTC_noon", 13689.09, "2018-01-02 16:00"),  # winter, EST = UTC-5
+    ("2018-01-02", "BTC_close", 14839.76, "2018-01-02 20:00"),
+    ("2018-01-02", "BTC_1700", 14802.0, "2018-01-02 21:00"),
+]
+
+
+@pytest.mark.parametrize("day, column, value, candle_open_utc", PINNED_BTC)
+def test_btc_pinned_spot_check_values(baseline, day, column, value, candle_open_utc):
+    assert baseline.loc[day, column] == value
+    candle = al.load_bitstamp().loc[pd.Timestamp(candle_open_utc, tz="UTC")]
+    assert candle["close"] == value and candle["volume"] > 0
+
+
 def test_btc_ignores_the_candle_after_target():
     hourly = _hourly("2024-08-04", "2024-08-07")
     days = pd.DatetimeIndex(["2024-08-05"])
