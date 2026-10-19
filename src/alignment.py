@@ -35,10 +35,10 @@ WINDOW_START, WINDOW_END = pd.Timestamp("2015-01-02"), pd.Timestamp("2026-09-30"
 BUILD_START = pd.Timestamp("2014-12-01")
 
 NY = "America/New_York"
-# Approved alignment plan, BTC sampling rule: the price at target time T is the close of the
+# DEVIATIONS.md, BTC sampling rule (approved alignment plan): the price at target time T is the close of the
 # hourly candle that ends at T (candles are labeled by open time).
 BTC_TARGETS = {"noon": 12, "close": 16, "1700": 17}  # section 5 rules 2 and 3; section 8.1 and 8.5
-# Approved alignment plan, zero-volume rule: walk back to the last candle with trades; leave
+# DEVIATIONS.md, BTC sampling rule, zero-volume part: walk back to the last candle with trades; leave
 # blank if that candle ended more than 6 hours before T (mirrors the section 4 gap limit).
 MAX_STALE_HOURS = 6
 
@@ -55,7 +55,7 @@ class AlignmentError(RuntimeError):
 # ---------------------------------------------------------------- calendar
 
 def nyse_calendar() -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
-    """Section 3: NYSE trading days, cross-checked against S&P 500 dates (approved decision A)."""
+    """Section 3: NYSE trading days, cross-checked against S&P 500 dates (DEVIATIONS.md, red-team documentation items)."""
     cal = xcals.get_calendar("XNYS", start=BUILD_START - pd.Timedelta(days=10), end=WINDOW_END + pd.Timedelta(days=10))
     days = cal.sessions_in_range(BUILD_START, WINDOW_END).tz_localize(None)
     spx = pd.DatetimeIndex(pd.to_datetime(pd.read_csv(RAW / "yfinance" / "SPX.csv")["Date"]))
@@ -130,7 +130,7 @@ def load_binance() -> pd.DataFrame:
 
 
 def sample_btc(hourly: pd.DataFrame, days: pd.DatetimeIndex, target_hour: int) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Price at target_hour New York on each NYSE day (approved sampling and zero-volume rules).
+    """Price at target_hour New York on each NYSE day (DEVIATIONS.md, BTC sampling rule).
 
     Uses the close of the candle that opens one hour before the target, so the price is the last
     trade at or before the target time. New York times are converted with the America/New_York
@@ -218,7 +218,7 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame]:
     d["r_spx"] = np.log(d["SPX"]).diff()
     d["dVIX"] = d["VIX"].diff()
 
-    # US yields, section 5 rule 8 (not lagged) and DEVIATIONS.md decision B: on days the Treasury
+    # US yields, section 5 rule 8 (not lagged) and the DEVIATIONS.md US Treasury holiday rule: on days the Treasury
     # market is closed while NYSE is open, the level carries over (change 0) and is flagged.
     for sid, name in [("DGS2", "US2Y"), ("DGS10", "US10Y"), ("DGS3MO", "US3M")]:
         lvl, closed, multi = _carried_level(_fred(sid), days)
@@ -242,7 +242,7 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame]:
     d["dJP2Y_lag1"] = d["dJP2Y"].shift(1)  # rule 6: robustness check 7 and any trading rule
     d["spread_lag1"] = (d["US2Y"] - d["JP2Y"]).shift(1)  # section 4: level, lagged one trading day
 
-    # BTC, section 5 rules 2 to 4 and the approved sampling rule. Weekends and NYSE holidays fall
+    # BTC, section 5 rules 2 to 4 and the DEVIATIONS.md BTC sampling rule. Weekends and NYSE holidays fall
     # inside the next trading day's return (rule 4); nothing is dropped.
     btc = load_bitstamp()
     binance = load_binance()

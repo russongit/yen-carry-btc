@@ -233,7 +233,7 @@ def test_fx_real_data_missing_days_are_blank(baseline):
     assert flagged[["r_yen", "r_dxyx", "r_eurusd"]].isna().all().all()
 
 
-# ---------------------------------------------------------------- 4. Treasuries (decision B) and JGBs (rules 6, 7)
+# ---------------------------------------------------------------- 4. Treasuries (DEVIATIONS.md US Treasury holiday rule) and JGBs (rules 6, 7)
 
 def test_carried_level_closed_day_and_spanning_day():
     # NYSE: Mon, Tue, Wed, Fri (closed Thu). Tokyo: Mon, Tue, Thu, Fri (closed Wed).
