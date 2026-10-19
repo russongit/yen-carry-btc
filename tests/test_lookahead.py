@@ -91,6 +91,47 @@ def test_future_data_does_not_change_past(baseline, monkeypatch, cutoff):
     assert not baseline.loc[future, "BTC_1700"].equals(scrambled.loc[future, "BTC_1700"])
 
 
+def _truncated_build(monkeypatch, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Rebuild with every input that became known after the cutoff removed, and the calendar ending at it."""
+    monkeypatch.setattr(al, "WINDOW_END", cutoff)
+    orig_fred = al._fred
+    monkeypatch.setattr(al, "_fred", lambda sid: orig_fred(sid).loc[:cutoff])
+
+    btc_cut = (cutoff + pd.Timedelta(days=1)).tz_localize(al.NY).tz_convert("UTC")
+    for loader in ("load_bitstamp", "load_binance"):
+        orig = getattr(al, loader)
+        monkeypatch.setattr(al, loader, lambda orig=orig: orig().loc[lambda df: df.index < btc_cut])
+
+    orig_read = pd.read_csv
+
+    def read_csv(path, *args, **kwargs):
+        df = orig_read(path, *args, **kwargs)
+        p = str(path).replace("\\", "/")
+        if "/yfinance/" in p:
+            return df[pd.to_datetime(df["Date"]) <= cutoff]
+        if "/mof_jgb/" in p:
+            return df[~(pd.to_datetime(df["Date"], format="%Y/%m/%d", errors="coerce") > cutoff)]
+        return df
+    monkeypatch.setattr(pd, "read_csv", read_csv)
+
+    resolved, _, _ = ing.cot_release_dates()
+    unreleased = {d for d, (r, _) in resolved.items() if pd.Timestamp(r) >= cutoff}
+    orig_cot = ing.load_cot_yen
+    monkeypatch.setattr(ing, "load_cot_yen", lambda: orig_cot().loc[
+        lambda df: (df["as_of"] <= cutoff.date()) & ~df["as_of"].isin(unreleased)].reset_index(drop=True))
+
+    return al.build()[0]
+
+
+@pytest.mark.parametrize("cutoff", ["2018-01-02", "2019-02-20", "2024-08-05"])
+def test_truncated_run_matches_full_run(baseline, monkeypatch, cutoff):
+    """Run on data cut off at t; every value up to t must equal the full run."""
+    cutoff = pd.Timestamp(cutoff)
+    truncated = _truncated_build(monkeypatch, cutoff)
+    assert truncated.index.max() == cutoff
+    pd.testing.assert_frame_equal(baseline.loc[:cutoff], truncated)
+
+
 # ---------------------------------------------------------------- 2. BTC sampling
 
 def _hourly(start: str, end: str) -> pd.DataFrame:
