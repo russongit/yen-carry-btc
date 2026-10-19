@@ -257,7 +257,103 @@ def test_cot_excluded_reports_never_appear(baseline):
     assert len(excluded) == 18
 
 
-# ---------------------------------------------------------------- 6. rolling and expanding statistics
+# ---------------------------------------------------------------- 6. rolling and expanding statistics (src/signals.py)
 
-# alignment.py computes none. Each expanding percentile added in src/signals.py (section 6)
-# gets its own test here, per the project rule.
+import signals as sg  # noqa: E402
+
+SIGNAL_CUTOFFS = ["2018-06-29", "2020-03-16", "2024-08-05"]
+SIGNAL_STATS = ["yen_move5", "yen_vol20", "yen_vol20_pct80", "yen_move5_pct90", "yen_move5_pct85",
+                "yen_move5_pct95", "spx_ret5", "vix_pct", "spx_ret5_pct"]
+SIGNAL_OUTPUTS = ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq", "signal_unavailable",
+                  "S_yen_episode", "S_vix_episode", "S_eq_episode"]
+
+
+@pytest.fixture(scope="module")
+def signals_full(baseline):
+    return sg.compute(baseline)
+
+
+@pytest.fixture(scope="module")
+def signals_truncated(baseline, signals_full):
+    """Signals rerun on aligned data cut off at each date, with the calibrated q held fixed."""
+    out, _ = signals_full
+    q_v, q_e = int(out["q_v"].iloc[0]), int(out["q_e"].iloc[0])
+    return {c: sg.compute(baseline.loc[:c], q_v=q_v, q_e=q_e)[0] for c in SIGNAL_CUTOFFS}
+
+
+@pytest.mark.parametrize("cutoff", SIGNAL_CUTOFFS)
+@pytest.mark.parametrize("column", SIGNAL_STATS + SIGNAL_OUTPUTS)
+def test_signal_statistic_uses_data_through_t_only(signals_full, signals_truncated, column, cutoff):
+    """One test per rolling or expanding statistic: a run cut off at t reproduces every value up to t."""
+    full = signals_full[0].loc[:cutoff, column]
+    pd.testing.assert_series_equal(full, signals_truncated[cutoff][column])
+
+
+def test_expanding_percentile_matches_numpy_through_t(signals_full):
+    out = signals_full[0]
+    for day in ["2018-01-02", "2021-06-30", "2024-08-05"]:
+        hist = out.loc[:day, "yen_move5"].dropna().to_numpy()
+        assert out.loc[day, "yen_move5_pct90"] == pytest.approx(np.percentile(hist, 90))
+
+
+def test_calibration_ignores_test_period(baseline, signals_full):
+    """Scrambling VIX and S&P 500 after the training period must not change q_V, q_E, or the grid."""
+    d = baseline.copy()
+    after = d.index > sg.TRAIN_END
+    d.loc[after, ["VIX", "SPX"]] *= SCRAMBLE
+    _, grid = sg.compute(d)
+    pd.testing.assert_frame_equal(grid, signals_full[1])
+
+
+def test_calibration_tie_break_prefers_fewer_firings(signals_full):
+    grid = signals_full[1]
+    eq = grid[grid["signal"] == "equity"]
+    best = eq[np.isclose(eq["abs_diff"], eq["abs_diff"].min(), rtol=0, atol=1e-12)]
+    assert int(eq.loc[eq["chosen"], "q"].iloc[0]) == int(best["q"].min())
+    vix = grid[grid["signal"] == "vix"]
+    best = vix[np.isclose(vix["abs_diff"], vix["abs_diff"].min(), rtol=0, atol=1e-12)]
+    assert int(vix.loc[vix["chosen"], "q"].iloc[0]) == int(best["q"].max())
+
+
+def test_yen_vol_rules_on_synthetic_returns():
+    days = pd.bdate_range("2024-01-01", periods=30)
+    r = pd.Series(np.linspace(-0.01, 0.01, 30), index=days)
+    d = pd.DataFrame({"r_yen": r, "fx_multi_day": False}, index=days)
+    vol = sg.yen_vol(d)
+    assert np.isnan(vol.iloc[18])  # fewer than 20 returns so far
+    assert vol.iloc[25] == pytest.approx(r.iloc[6:26].std(ddof=1) * np.sqrt(252))
+    # Two missing days and two multi-day returns leave 16 usable: blank.
+    d2 = d.copy()
+    d2.iloc[[20, 22], 0] = np.nan
+    d2.iloc[[21, 23], 1] = True
+    assert np.isnan(sg.yen_vol(d2).iloc[25])
+    # One missing and one multi-day leave 18: defined, and the multi-day return is not used.
+    d3 = d.copy()
+    d3.iloc[20, 0] = np.nan
+    d3.iloc[21, 1] = True
+    usable = r.iloc[6:26].drop(r.index[[20, 21]])
+    assert sg.yen_vol(d3).iloc[25] == pytest.approx(usable.std(ddof=1) * np.sqrt(252))
+
+
+def test_yen_move_uses_last_fixing_on_or_before_t_minus_5():
+    days = pd.bdate_range("2024-10-07", periods=8)
+    usdjpy = pd.Series([150, 151, 152, 153, 154, 155, 156, 157], index=days, dtype=float)
+    usdjpy.iloc[1] = np.nan  # no fixing on 2024-10-08
+    move, long_window = sg.yen_move(pd.DataFrame({"DEXJPUS": usdjpy}))
+    assert move.iloc[6] == pytest.approx(-np.log(156 / 150)) and long_window.iloc[6]
+    assert move.iloc[7] == pytest.approx(-np.log(157 / 152)) and not long_window.iloc[7]
+
+
+def test_unavailable_days_are_zero_and_burn_in_is_blank(signals_full):
+    out = signals_full[0]
+    unavailable = out[out["signal_unavailable"]]
+    assert len(unavailable) == 44 and (unavailable["S_yen"] == 0).all()
+    assert out.loc[:"2017-12-29", ["S_yen", "S_yen_p85", "S_yen_p95", "S_vix", "S_eq"]].isna().all().all()
+
+
+def test_episode_gap_of_ten_trading_days():
+    s = pd.Series(0, index=pd.RangeIndex(40), dtype="Int8")
+    s.iloc[[0, 10, 21, 22]] = 1  # 10 days apart: same episode; 11 days apart: new episode
+    ep, start = sg.episodes(s)
+    assert list(ep.iloc[[0, 10, 21, 22]]) == [1, 1, 2, 2]
+    assert list(start[start].index) == [0, 21]
