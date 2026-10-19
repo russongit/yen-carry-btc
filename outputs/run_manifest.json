@@ -1,0 +1,15 @@
+{
+  "run_commit": "9606af028f62981df40418a347a5dfb53e46fd49",
+  "run_utc": "2026-10-19T13:18:41Z",
+  "statsmodels": "0.15.0",
+  "pandas": "2.2.2",
+  "numpy": "2.1.0",
+  "n_specifications": 124,
+  "outputs": [
+    "tables/regressions.csv",
+    "tables/verdicts.csv",
+    "tables/h1b_lp_bands.csv",
+    "tables/jp2y_sd_by_year.csv",
+    "figures/h1b_lp.png"
+  ]
+}
